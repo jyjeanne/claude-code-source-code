@@ -1,0 +1,143 @@
+@startuml activity-diagram
+' Claude Code v2.1.88 — Activity Diagram
+' Main agent loop and key sub-flows
+
+skinparam activityBackgroundColor #FAFAFA
+skinparam activityBorderColor #555
+skinparam activityDiamondBackgroundColor #FFF9C4
+skinparam activityDiamondBorderColor #888
+skinparam arrowColor #333
+skinparam noteBackgroundColor #E8F4FD
+skinparam noteBorderColor #90CAF9
+skinparam partitionBackgroundColor #F5F5F5
+
+' ══════════════════════════════════════════════
+' MAIN AGENT LOOP
+' ══════════════════════════════════════════════
+
+title Claude Code — Main Agent Loop (query.ts)
+
+|User Input Layer|
+start
+:User submits prompt;
+
+|Query Engine|
+:processUserInput()\n──────────────────\nParse slash commands\nBuild UserMessage\nHandle file attachments;
+
+if (Slash command?) then (yes)
+  :Execute command\n(/plan, /config, /login...);
+  stop
+else (no)
+endif
+
+:fetchSystemPromptParts()\n──────────────────────────\nAssemble system prompt\nInject active tools\nLoad CLAUDE.md memory files\nApply permission rules;
+
+:recordTranscript()\n────────────────────\nPersist user message\nto JSONL on disk;
+
+|Context Management|
+loop_start:
+:normalizeMessagesForAPI()\n──────────────────────────\nStrip UI-only fields\nDeduplicate compact markers;
+
+if (Token budget exceeded?) then (yes)
+  :autoCompact()\n──────────────────\nSummarize old messages\nvia compact API call\nInsert compact_boundary;
+  note right
+    Three strategies:
+    1. autoCompact (summarize)
+    2. snipCompact (trim zombies)
+    3. contextCollapse (restructure)
+  end note
+  goto loop_start
+else (no)
+endif
+
+|Claude API|
+:POST /v1/messages\n──────────────────────\nmodel + tools + system prompt\nStreaming enabled\nAbortController attached;
+
+|Stream Processing|
+repeat
+  if (Stream event type?) then (text delta)
+    :Emit text to consumer\n(REPL / SDK);
+  else (tool_use block)
+    :Buffer tool_use block;
+  else (message_stop)
+  endif
+repeat while (More stream events?) is (yes)
+-> no;
+
+|Tool Dispatch|
+if (stop_reason?) then (tool_use)
+
+  :StreamingToolExecutor\n──────────────────────\nPartition: concurrent vs serial\nSafe in parallel: Glob, Grep, Read\nSerial: Bash, FileEdit, FileWrite;
+
+  |Permission System|
+  while (More tools to execute?) is (yes)
+
+    :tool.validateInput(args, context)\n─────────────────────────────────\nZod schema + tool-specific rules;
+
+    if (Input valid?) then (no)
+      :Append tool_result(error);
+    else (yes)
+
+      :Run PreToolUse Hooks\n────────────────────\nUser-defined shell scripts\nCan: approve / deny / modify;
+
+      if (Hook decision?) then (deny)
+        :Append tool_result(permission denied);
+      else (approve / no hook)
+
+        :Check permission rules\n──────────────────────────\nalwaysAllowRules → auto-approve\nalwaysDenyRules  → auto-deny\nalwaysAskRules   → force prompt;
+
+        if (Rule match?) then (always allow)
+          ' fall through to call
+        else if (Rule match?) then (always deny)
+          :Append tool_result(denied);
+        else (no rule)
+
+          |User Interaction|
+          :Show permission dialog\n────────────────────────\nTool name + input preview\nAllow Once / Always / Deny;
+
+          if (User decision?) then (deny)
+            :Append tool_result(denied);
+          else (allow)
+          endif
+        endif
+
+        if (Permission granted?) then (yes)
+          |Tool Execution|
+          :tool.checkPermissions()\n─────────────────────────\nTool-specific logic\n(e.g. path sandboxing);
+
+          if (Tool permission ok?) then (yes)
+            :tool.call(args, context)\n─────────────────────────\nExecute tool logic\nEmit progress events\nReturn ToolResult;
+
+            if (Tool error?) then (yes)
+              :Append tool_result(error details);
+            else (no)
+              :Append tool_result to messages[]\nrecordTranscript();
+            end if
+          else (no)
+            :Append tool_result(denied);
+          endif
+        endif
+      endif
+    endif
+
+  endwhile (no)
+
+  |Query Engine|
+  if (Abort signal?) then (yes)
+    :Emit AbortError;
+    stop
+  else (no)
+    goto loop_start
+  endif
+
+else (end_turn)
+
+  :recordTranscript(assistantMessage);
+
+  |User Input Layer|
+  :Yield final result message\n(text, usage, cost, session_id);
+  stop
+
+endif
+
+@enduml

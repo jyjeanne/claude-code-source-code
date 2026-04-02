@@ -1,0 +1,321 @@
+@startuml sequence-diagram
+' Claude Code v2.1.88 — Sequence Diagrams
+' Key interaction flows between components
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #FAFAFA
+skinparam sequenceParticipantBorderColor #555
+skinparam sequenceActorBackgroundColor #E8F4FD
+skinparam sequenceActorBorderColor #1565C0
+skinparam sequenceGroupBackgroundColor #FFFDE7
+skinparam sequenceGroupBorderColor #F9A825
+skinparam noteFontSize 11
+skinparam noteBackgroundColor #E8F8E8
+skinparam noteBorderColor #66BB6A
+skinparam sequenceLifeLineBorderColor #777
+skinparam sequenceDividerBackgroundColor #EEE
+
+' ══════════════════════════════════════════════════════════════════
+' DIAGRAM 1: Full Tool Call Lifecycle
+' ══════════════════════════════════════════════════════════════════
+
+title 1. Full Tool Call Lifecycle
+
+actor       User      as "User"
+participant REPL      as "REPL\n(main.tsx)"
+participant QE        as "QueryEngine"
+participant query     as "query()"
+participant STE       as "Streaming\nToolExecutor"
+participant Perms     as "Permission\nSystem"
+participant Tool      as "Tool.call()"
+participant API       as "Claude API"
+participant FS        as "File System"
+
+User  -> REPL  : submit prompt
+REPL  -> QE    : submitMessage(prompt, messages, options)
+QE    -> query : processUserInput()
+query -> query : fetchSystemPromptParts()
+note right of query
+  Assemble system prompt
+  Load CLAUDE.md memory
+  Inject active tools
+end note
+
+query -> FS    : recordTranscript(userMessage)
+query -> query : normalizeMessagesForAPI()
+query -> API   : POST /v1/messages (streaming)
+
+loop stream events
+  API --> query : content_block_delta (text)
+  query --> QE  : yield SDKMessage (text)
+  QE    --> REPL : stream text
+  REPL  --> User : display text
+end
+
+API   --> query : content_block (tool_use: BashTool)
+API   --> query : message_stop [stop_reason=tool_use]
+
+query -> STE : execute([toolUseBlock], context)
+STE   -> STE : partition(concurrent vs serial)
+
+STE   -> Tool : validateInput(args, context)
+
+alt invalid input
+  Tool --> STE  : ValidationResult { result: false }
+  STE  -> query : append tool_result(error)
+else valid input
+  Tool --> STE  : ValidationResult { result: true }
+
+  STE  -> Perms : runPreToolUseHooks(toolName, args)
+  note right of Perms
+    Execute user-defined
+    shell hook scripts
+  end note
+
+  alt hook denies
+    Perms --> STE  : decision: deny
+    STE   -> query : append tool_result(permission denied)
+  else hook approves / no hook
+    Perms --> STE  : decision: approve / passthrough
+
+    STE  -> Perms : checkPermissionRules(toolName, args)
+    note right of Perms
+      alwaysAllowRules → auto-approve
+      alwaysDenyRules  → auto-deny
+      alwaysAskRules   → force prompt
+    end note
+
+    alt no matching rule
+      Perms -> REPL : showPermissionDialog(toolName, args)
+      REPL  -> User : display permission prompt
+      User  -> REPL : Allow / Deny
+      REPL  -> Perms : user decision
+    end
+
+    alt permission denied
+      Perms --> STE : PermissionResult: denied
+      STE   -> query : append tool_result(denied)
+    else permission granted
+      Perms --> STE : PermissionResult: approved
+
+      STE  -> Tool  : call(args, context, canUseTool, parentMsg, onProgress)
+      note right of Tool : Execute shell command\nStream output
+
+      loop tool progress
+        Tool --> STE  : onProgress(BashProgress)
+        STE  --> REPL : setToolJSX(progressUI)
+        REPL --> User : display progress
+      end
+
+      Tool --> STE  : ToolResult { data: { stdout, stderr, exitCode } }
+      STE  -> query : tool_results[]
+    end
+  end
+end
+
+query -> FS    : recordTranscript(assistantMessage + tool_results)
+query -> query : normalizeMessagesForAPI()
+note right of query : Loop back to API\nwith tool results
+
+query -> API   : POST /v1/messages [with tool_results]
+API  --> query : final response [stop_reason=end_turn]
+query --> QE   : yield final SDKMessage
+QE   --> REPL  : final result
+REPL --> User  : display final response
+
+|||
+
+' ══════════════════════════════════════════════════════════════════
+' DIAGRAM 2: Session Startup & Initialization
+' ══════════════════════════════════════════════════════════════════
+
+newpage
+
+title 2. Session Startup & Initialization
+
+actor       User    as "User"
+participant CLI     as "cli.tsx"
+participant main    as "main.tsx"
+participant Config  as "Config / Auth"
+participant MCP     as "MCP\nConnectionManager"
+participant GB      as "GrowthBook"
+participant REPL    as "REPL.tsx"
+
+User -> CLI   : claude [args]
+CLI  -> CLI   : profileCheckpoint('main_tsx_entry')
+
+par parallel startup prefetches
+  CLI -> CLI  : startMdmRawRead()
+  note right : Read MDM policy\n(macOS/Windows)
+else
+  CLI -> CLI  : startKeychainPrefetch()
+  note right : Prefetch OAuth token\n+ API key from keychain
+end
+
+CLI  -> main  : init(options)
+main -> Config : getGlobalConfig()
+main -> Config : checkHasTrustDialogAccepted()
+
+alt first run
+  main -> REPL  : show trust dialog
+  User -> REPL  : accept
+  main -> Config : saveGlobalConfig()
+end
+
+main -> Config : applySafeConfigEnvironmentVariables()
+main -> GB     : initializeGrowthBook()
+GB  --> main   : feature flags loaded
+
+par parallel initializations
+  main -> Config : prefetchAwsCredentials()
+else
+  main -> MCP    : prefetchOfficialMcpUrls()
+else
+  main -> main   : prefetchFastModeStatus()
+end
+
+main -> MCP : connect MCP servers (from settings.json)
+
+loop each configured MCP server
+  MCP  -> MCP  : spawn / connect transport\n(stdio / sse / http / ws)
+  MCP  -> MCP  : list available tools
+  MCP --> main : MCP tools registered
+end
+
+main -> REPL  : launchRepl(options, tools, commands)
+REPL --> User : display terminal UI
+
+|||
+
+' ══════════════════════════════════════════════════════════════════
+' DIAGRAM 3: Multi-Agent Team Protocol
+' ══════════════════════════════════════════════════════════════════
+
+newpage
+
+title 3. Multi-Agent Team Protocol
+
+participant Lead       as "Lead Agent\n(Coordinator)"
+participant TaskBoard  as "TaskBoard\n(file-based)"
+participant TeammateA  as "Teammate A"
+participant TeammateB  as "Teammate B"
+
+Lead -> TaskBoard : TaskCreateTool(title, description, deps)
+note right of TaskBoard : Write task_1.json\nto disk
+
+Lead -> TeammateA : TeamCreateTool(agentType)
+Lead -> TeammateB : TeamCreateTool(agentType)
+
+activate TeammateA
+activate TeammateB
+
+par autonomous claim loop
+  TeammateA -> TaskBoard : TaskListTool(status: pending)
+  TaskBoard --> TeammateA : [task_1, task_2, ...]
+  TeammateA -> TaskBoard : TaskUpdateTool(task_1, in_progress)
+  note right of TeammateA : Claim task_1
+else
+  TeammateB -> TaskBoard : TaskListTool(status: pending)
+  TaskBoard --> TeammateB : [task_2, ...]
+  TeammateB -> TaskBoard : TaskUpdateTool(task_2, in_progress)
+  note right of TeammateB : Claim task_2
+end
+
+TeammateA -> TeammateA : Execute task_1\n(BashTool, FileEdit, ...)
+TeammateA -> Lead      : SendMessageTool("task_1 done")
+Lead      --> TeammateA : SendMessageTool("acknowledged")
+TeammateA -> TaskBoard  : TaskUpdateTool(task_1, completed)
+
+TeammateB -> TeammateB  : Execute task_2
+TeammateB -> TaskBoard  : TaskUpdateTool(task_2, completed)
+
+deactivate TeammateA
+deactivate TeammateB
+
+Lead -> TaskBoard : TaskListTool(status: pending)
+TaskBoard --> Lead : [] (empty)
+
+Lead -> TeammateA : TeamDeleteTool()
+Lead -> TeammateB : TeamDeleteTool()
+note right of Lead : Mission complete
+
+|||
+
+' ══════════════════════════════════════════════════════════════════
+' DIAGRAM 4: MCP OAuth Authentication Flow
+' ══════════════════════════════════════════════════════════════════
+
+newpage
+
+title 4. MCP OAuth Authentication Flow
+
+participant Tool    as "MCPTool"
+participant MCP     as "MCPConnection\nManager"
+participant Auth    as "McpAuthTool\n/ OAuth"
+participant Server  as "Remote MCP\nServer"
+participant User    as "User (UI)"
+participant KC      as "Keychain"
+
+Tool -> MCP    : invoke mcp__server__action(args)
+MCP  -> Server : tool request (HTTP transport)
+
+alt server requires auth
+  Server --> MCP  : 401 / OAuth challenge
+  MCP    -> Auth  : start OAuth flow
+  Auth   -> User  : display authorization URL
+  User   -> Auth  : visit URL + authorize
+  Auth   -> Auth  : receive OAuth code
+  Auth   -> Server : exchange code for token
+  Server --> Auth  : access_token + refresh_token
+  Auth   -> KC    : store tokens in keychain
+  note right of KC : Persisted across sessions
+else valid token cached
+  MCP -> KC : load token from keychain
+  KC --> MCP : access_token
+end
+
+MCP    -> Server : tool request + Bearer token
+Server --> MCP   : tool result
+MCP    --> Tool  : ToolResult
+
+|||
+
+' ══════════════════════════════════════════════════════════════════
+' DIAGRAM 5: Context Compaction Flow
+' ══════════════════════════════════════════════════════════════════
+
+newpage
+
+title 5. Context Compaction Flow
+
+participant query   as "query()"
+participant compact as "services/\ncompact/"
+participant API     as "Claude API"
+participant FS      as "File System"
+
+query   -> query   : calculateTokenWarningState(messages)
+note right of query : Check if threshold exceeded
+
+alt compaction required
+  query   -> compact : buildCompactMessages(messages)
+  compact -> compact : getMessagesAfterCompactBoundary()
+  note right of compact
+    Split messages:
+    - old: before last compact_boundary
+    - recent: after last compact_boundary
+  end note
+
+  compact -> API : POST /v1/messages\n(compaction prompt + old messages)
+  note right of API : Summarize conversation\nhistory into plain text
+
+  API --> compact  : summary text
+  compact -> compact : rebuild messages[]\n[summary] + [compact_boundary] + [recent]
+  compact --> query : compacted messages[]
+
+  query -> FS : recordTranscript(compact_boundary_marker)
+end
+
+query -> query : normalizeMessagesForAPI(messages)
+note right of query : Resume normal agent loop
+
+@enduml

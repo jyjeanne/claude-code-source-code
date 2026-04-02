@@ -1,0 +1,388 @@
+@startuml class-diagram
+' Claude Code v2.1.88 — Class Diagram
+' Core types and relationships
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam classBackgroundColor #FAFAFA
+skinparam classBorderColor #555
+skinparam arrowColor #333
+skinparam stereotypeCBackgroundColor #E8F4FD
+skinparam stereotypeIBackgroundColor #E8F8E8
+
+' ─────────────────────────────────────────────
+' CORE TOOL SYSTEM
+' ─────────────────────────────────────────────
+
+interface Tool<Input, Output, P> {
+  + name : string
+  + aliases : string[]
+  + searchHint : string
+  + inputSchema : AnyObject
+  + maxResultSizeChars : number
+  + shouldDefer : boolean
+  + alwaysLoad : boolean
+  + strict : boolean
+  --
+  + call(args, context, canUseTool, parentMsg, onProgress) : Promise<ToolResult>
+  + description(input, options) : Promise<string>
+  + checkPermissions(input, context) : Promise<PermissionResult>
+  + validateInput(input, context) : Promise<ValidationResult>
+  + isEnabled() : boolean
+  + isReadOnly(input) : boolean
+  + isDestructive(input) : boolean
+  + isConcurrencySafe(input) : boolean
+  + interruptBehavior() : "cancel" | "block"
+  + isSearchOrReadCommand(input) : object
+  + backfillObservableInput(input) : void
+}
+
+class ToolResult<T> {
+  + data : T
+  + newMessages : Message[]
+  + contextModifier : Function
+  + mcpMeta : object
+}
+
+class ValidationResult {
+  + result : boolean
+  + message : string
+  + errorCode : number
+}
+
+class ToolDef<Input, Output> {
+  <<factory input>>
+  + name : string
+  + description : Function
+  + inputSchema : ZodType
+  + outputSchema : ZodType
+  + call : Function
+  + checkPermissions : Function
+  + isReadOnly : Function
+  + isConcurrencySafe : Function
+  + maxResultSizeChars : number
+}
+
+note top of ToolDef
+  Passed to buildTool() factory.
+  buildTool(def satisfies ToolDef) → Tool
+end note
+
+' ─────────────────────────────────────────────
+' CONTEXT
+' ─────────────────────────────────────────────
+
+class ToolUseContext {
+  + options : ToolUseContextOptions
+  + abortController : AbortController
+  + readFileState : FileStateCache
+  + messages : Message[]
+  + agentId : AgentId
+  + agentType : string
+  + toolUseId : string
+  + requireCanUseTool : boolean
+  --
+  + getAppState() : AppState
+  + setAppState(f) : void
+  + setToolJSX(args) : void
+  + addNotification(notif) : void
+  + setInProgressToolUseIDs(f) : void
+  + setResponseLength(f) : void
+  + updateFileHistoryState(f) : void
+  + updateAttributionState(f) : void
+  + requestPrompt(sourceName) : Function
+}
+
+class ToolUseContextOptions {
+  + commands : Command[]
+  + debug : boolean
+  + mainLoopModel : string
+  + tools : Tool[]
+  + verbose : boolean
+  + thinkingConfig : ThinkingConfig
+  + mcpClients : MCPServerConnection[]
+  + mcpResources : Record<string, ServerResource[]>
+  + isNonInteractiveSession : boolean
+  + agentDefinitions : AgentDefinitionsResult
+  + maxBudgetUsd : number
+  + customSystemPrompt : string
+  + appendSystemPrompt : string
+}
+
+' ─────────────────────────────────────────────
+' STATE
+' ─────────────────────────────────────────────
+
+class AppState {
+  + toolPermissionContext : ToolPermissionContext
+  + fileHistory : FileHistoryState
+  + attribution : AttributionState
+  + verbose : boolean
+  + mainLoopModel : string
+  + fastMode : FastModeState
+  + speculation : SpeculationState
+}
+
+class ToolPermissionContext {
+  + mode : PermissionMode
+  + additionalWorkingDirectories : Map<string, AdditionalWorkingDirectory>
+  + alwaysAllowRules : ToolPermissionRulesBySource
+  + alwaysDenyRules : ToolPermissionRulesBySource
+  + alwaysAskRules : ToolPermissionRulesBySource
+  + isBypassPermissionsModeAvailable : boolean
+  + shouldAvoidPermissionPrompts : boolean
+  + awaitAutomatedChecksBeforeDialog : boolean
+}
+
+enum PermissionMode {
+  default
+  plan
+  acceptEdits
+  bypassPermissions
+  autoEdit
+}
+
+' ─────────────────────────────────────────────
+' MESSAGES
+' ─────────────────────────────────────────────
+
+abstract class Message {
+  <<discriminated union>>
+  + type : string
+  + uuid : string
+}
+
+class UserMessage {
+  + type = "user"
+  + content : ContentBlock[]
+  + isMeta : boolean
+}
+
+class AssistantMessage {
+  + type = "assistant"
+  + content : ContentBlock[]
+  + usage : Usage
+  + model : string
+  + stop_reason : string
+}
+
+class SystemMessage {
+  + type = "system"
+  + subtype : string
+  + content : string
+}
+
+class ProgressMessage<P> {
+  + type = "progress"
+  + toolUseID : string
+  + data : P
+}
+
+class TombstoneMessage {
+  + type = "tombstone"
+  + replacedId : string
+}
+
+class AttachmentMessage {
+  + type = "attachment"
+  + content : ContentBlock[]
+}
+
+' ─────────────────────────────────────────────
+' COMMANDS
+' ─────────────────────────────────────────────
+
+interface Command {
+  + type : "local" | "local-jsx" | "prompt"
+  + name : string
+  + description : string
+  + supportsNonInteractive : boolean
+  --
+  + isEnabled() : boolean
+  + load() : Promise<CommandModule>
+}
+
+' ─────────────────────────────────────────────
+' QUERY ENGINE
+' ─────────────────────────────────────────────
+
+class QueryEngine {
+  - options : ToolUseContextOptions
+  --
+  + submitMessage(prompt, messages, options) : AsyncGenerator<SDKMessage>
+}
+
+class StreamingToolExecutor {
+  --
+  + execute(toolUseBlocks, context) : Promise<ToolResult[]>
+  - partition(tools) : ConcurrentGroup[]
+  - runConcurrent(group, context) : Promise<ToolResult[]>
+  - runSerial(tools, context) : Promise<ToolResult[]>
+}
+
+' ─────────────────────────────────────────────
+' CONCRETE TOOLS
+' ─────────────────────────────────────────────
+
+class BashTool {
+  + name = "Bash"
+  + call(args, context) : Promise<ToolResult>
+  + checkPermissions(input, context) : Promise<PermissionResult>
+  + isReadOnly(input) : boolean
+  + isConcurrencySafe(input) : boolean
+}
+
+class FileReadTool {
+  + name = "Read"
+  + call(args, context) : Promise<ToolResult>
+  + isReadOnly() : boolean
+  + maxResultSizeChars = Infinity
+}
+
+class FileEditTool {
+  + name = "Edit"
+  + call(args, context) : Promise<ToolResult>
+  + isDestructive() : boolean
+  + isConcurrencySafe() : boolean
+}
+
+class GlobTool {
+  + name = "Glob"
+  + isReadOnly() : boolean
+  + isConcurrencySafe() : boolean
+}
+
+class GrepTool {
+  + name = "Grep"
+  + isReadOnly() : boolean
+  + isConcurrencySafe() : boolean
+}
+
+class AgentTool {
+  + name = "Task"
+  + call(args, context) : Promise<ToolResult>
+  - spawnSubagent(context, mode) : AgentId
+  - createSubagentContext(parent) : ToolUseContext
+}
+
+class MCPTool {
+  + name : string
+  + isMcp : boolean
+  + mcpInfo : McpInfo
+  + call(args, context) : Promise<ToolResult>
+}
+
+class SkillTool {
+  + name = "use_skill"
+  + call(args, context) : Promise<ToolResult>
+}
+
+' ─────────────────────────────────────────────
+' TASKS
+' ─────────────────────────────────────────────
+
+abstract class Task {
+  <<base>>
+  + id : string
+  + type : string
+  + status : TaskStatus
+}
+
+class LocalShellTask {
+  + type = "local_bash"
+  + command : string
+  + exec() : Promise<ExecResult>
+}
+
+class LocalAgentTask {
+  + type = "local_agent"
+  + agentId : AgentId
+}
+
+class RemoteAgentTask {
+  + type = "remote_agent"
+  + bridgeSessionId : string
+}
+
+class InProcessTeammateTask {
+  + type = "in_process"
+  + sendMessage(msg) : void
+}
+
+class DreamTask {
+  + type = "dream"
+  + run() : Promise<void>
+}
+
+enum TaskStatus {
+  pending
+  running
+  completed
+  failed
+  cancelled
+}
+
+' ─────────────────────────────────────────────
+' BRANDED TYPES
+' ─────────────────────────────────────────────
+
+class AgentId << (T, #FFE0B2) branded string >> {
+  __brand : "AgentId"
+}
+
+class SessionId << (T, #FFE0B2) branded string >> {
+  __brand : "SessionId"
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+' Tool implementations
+Tool <|.. BashTool
+Tool <|.. FileReadTool
+Tool <|.. FileEditTool
+Tool <|.. GlobTool
+Tool <|.. GrepTool
+Tool <|.. AgentTool
+Tool <|.. MCPTool
+Tool <|.. SkillTool
+
+' Context composition
+ToolUseContext *-- ToolUseContextOptions : options
+ToolUseContext --> AppState : getAppState()
+AppState *-- ToolPermissionContext : contains
+ToolPermissionContext --> PermissionMode : mode
+
+' Message hierarchy
+Message <|-- UserMessage
+Message <|-- AssistantMessage
+Message <|-- SystemMessage
+Message <|-- ProgressMessage
+Message <|-- TombstoneMessage
+Message <|-- AttachmentMessage
+
+' Task hierarchy
+Task <|-- LocalShellTask
+Task <|-- LocalAgentTask
+Task <|-- RemoteAgentTask
+Task <|-- InProcessTeammateTask
+Task <|-- DreamTask
+Task --> TaskStatus : status
+
+' Engine relationships
+QueryEngine --> StreamingToolExecutor : delegates
+QueryEngine --> ToolUseContext : creates
+StreamingToolExecutor --> Tool : calls
+Tool --> ToolResult : returns
+Tool --> ValidationResult : validateInput returns
+Tool --> ToolUseContext : receives context
+
+' Agent spawning
+AgentTool --> ToolUseContext : creates sub-context
+AgentTool --> LocalAgentTask : spawns
+
+' Factory
+ToolDef ..> Tool : buildTool() produces
+
+@enduml
